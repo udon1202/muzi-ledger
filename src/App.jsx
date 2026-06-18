@@ -283,10 +283,10 @@ export default function App() {
               <div className="bg-gradient-to-br from-slate-800 to-slate-900 rounded-2xl p-6 text-white shadow-lg relative overflow-hidden">
                 <div className="absolute top-0 right-0 p-4 opacity-10"><Wallet size={100} /></div>
                 <p className="text-slate-300 text-sm font-medium mb-1 flex items-center gap-2"><CreditCard size={16} /> 目前總欠款餘額</p>
-                <h1 className="text-4xl font-bold mb-6 text-red-400 tracking-tight">${outstandingBalance.toLocaleString()}</h1>
+                <h1 className="text-4xl font-bold mb-6 text-red-400 tracking-tight">NT${outstandingBalance.toLocaleString()}</h1>
                 <div className="flex justify-between border-t border-slate-700 pt-4">
-                  <div><p className="text-slate-400 text-xs mb-1">原始總欠款</p><p className="font-semibold">${totalDebt.toLocaleString()}</p></div>
-                  <div className="text-right"><p className="text-slate-400 text-xs mb-1">已共同還款</p><p className="font-semibold text-green-400">${totalPaid.toLocaleString()}</p></div>
+                  <div><p className="text-slate-400 text-xs mb-1">原始總欠款</p><p className="font-semibold">NT${totalDebt.toLocaleString()}</p></div>
+                  <div className="text-right"><p className="text-slate-400 text-xs mb-1">已共同還款</p><p className="font-semibold text-green-400">NT${totalPaid.toLocaleString()}</p></div>
                 </div>
               </div>
 
@@ -312,11 +312,11 @@ export default function App() {
                               <Trash2 size={16} />
                             </button>
                           </div>
-                          <p className="text-sm text-slate-500 mt-1">總額 ${debt.totalAmount.toLocaleString()} • 分 {debt.periods} 期</p>
+                          <p className="text-sm text-slate-500 mt-1">總額 NT${debt.totalAmount.toLocaleString()} • 分 {debt.periods} 期</p>
                         </div>
                         <div className="bg-blue-100 text-blue-800 px-3 py-2 rounded-lg text-center shadow-inner">
                           <p className="text-[10px] font-bold flex items-center justify-center gap-1 mb-1 text-blue-600"><Users size={12} /> 一人一月</p>
-                          <p className="text-xl font-black">${perPersonMonthly.toLocaleString()}</p>
+                          <p className="text-xl font-black">NT${perPersonMonthly.toLocaleString()}</p>
                         </div>
                       </div>
 
@@ -373,8 +373,8 @@ export default function App() {
                 <div>
                   <label className="block text-sm font-bold text-slate-600 mb-2">總金額 (元)</label>
                   <div className="relative">
-                    <span className="absolute left-4 top-3 text-slate-400">$</span>
-                    <input type="number" value={formAmount} onChange={(e) => setFormAmount(e.target.value)} placeholder="輸入總欠款" className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 pl-8 outline-none focus:border-blue-500 focus:bg-white transition-colors text-slate-800 font-bold text-lg" />
+                    <span className="absolute left-3 top-3 text-slate-400 font-medium">NT$</span>
+                    <input type="number" value={formAmount} onChange={(e) => setFormAmount(e.target.value)} placeholder="輸入總欠款" className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 pl-12 outline-none focus:border-blue-500 focus:bg-white transition-colors text-slate-800 font-bold text-lg" />
                   </div>
                 </div>
                 <div>
@@ -395,7 +395,7 @@ export default function App() {
                 {formAmount && formPeriods > 0 && (
                   <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 mt-4 flex justify-between items-center">
                     <div className="flex items-center gap-2 text-blue-800"><Calculator size={18} /><span className="font-bold text-sm">每人每月需繳試算：</span></div>
-                    <div className="text-xl font-black text-blue-600">${Math.round((Number(formAmount) / formPeriods) / 2).toLocaleString()}</div>
+                    <div className="text-xl font-black text-blue-600">NT${Math.round((Number(formAmount) / formPeriods) / 2).toLocaleString()}</div>
                   </div>
                 )}
               </div>
@@ -428,4 +428,3 @@ export default function App() {
     </div>
   );
 }
-                        
