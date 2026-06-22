@@ -15,7 +15,8 @@ import {
   Edit,
   WifiOff,
   Database,
-  AlertCircle
+  AlertCircle,
+  RefreshCw
 } from 'lucide-react';
 
 // --- Firebase 雲端資料庫模組 ---
@@ -40,6 +41,14 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+
+// 預設的帳本資料 (用來確保資料庫有東西)
+const pdfImportData = [
+  { id: '1700000000001', name: '溫拿保險', totalAmount: 14966, periods: 12, startYear: 2025, startMonth: 12, paidPeriods: [0, 1, 2, 3, 4, 5] },
+  { id: '1700000000002', name: '溫拿稅金', totalAmount: 7120, periods: 12, startYear: 2025, startMonth: 12, paidPeriods: [0, 1, 2, 3, 4, 5] },
+  { id: '1700000000003', name: '烏冬保險', totalAmount: 6996, periods: 12, startYear: 2025, startMonth: 12, paidPeriods: [0, 1, 2, 3, 4, 5] },
+  { id: '1700000000004', name: '溫拿保養', totalAmount: 9417, periods: 6, startYear: 2026, startMonth: 1, paidPeriods: [0] }
+];
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('list');
@@ -88,16 +97,26 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
     setSyncStatus('connecting');
-    const debtsRef = collection(db, 'shared_debts');
+    // ⚠️ 關鍵更新：換一個全新的資料庫頻道，避免與舊資料卡住衝突
+    const debtsRef = collection(db, 'muzi_debts_v4');
     
-    const unsubscribe = onSnapshot(debtsRef, (snapshot) => {
+    const unsubscribe = onSnapshot(debtsRef, async (snapshot) => {
       setSyncStatus('synced');
       setDbError(null);
       
-      const loadedDebts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      loadedDebts.sort((a, b) => Number(a.id) - Number(b.id)); // 依建立時間排序
-      setDebts(loadedDebts); // Firebase 本機快取會瞬間觸發此處，讓畫面瞬間更新
-      setIsLoading(false);
+      // 如果發現新頻道是空的，自動幫您塞入基礎資料，確認連線暢通！
+      if (snapshot.empty) {
+        setIsLoading(true);
+        for (const debt of pdfImportData) {
+          const debtDoc = doc(db, 'muzi_debts_v4', debt.id);
+          await setDoc(debtDoc, debt);
+        }
+      } else {
+        const loadedDebts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        loadedDebts.sort((a, b) => Number(a.id) - Number(b.id)); // 依建立時間排序
+        setDebts(loadedDebts); 
+        setIsLoading(false);
+      }
     }, (error) => {
       console.error("Firebase 連線錯誤:", error);
       setSyncStatus('error');
@@ -142,7 +161,7 @@ export default function App() {
     
     const syncUpdate = async () => {
       try {
-        const savePromise = setDoc(doc(db, 'shared_debts', debtId), { ...debt, paidPeriods: newPaidPeriods }, { merge: true });
+        const savePromise = setDoc(doc(db, 'muzi_debts_v4', debtId), { ...debt, paidPeriods: newPaidPeriods }, { merge: true });
         const timeout = new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000));
         await Promise.race([savePromise, timeout]);
         if (!isPaid) showToast('✅ 繳款紀錄已同步！對方已可看見', 'success');
@@ -160,7 +179,7 @@ export default function App() {
     
     const syncDelete = async () => {
       try {
-        const delPromise = deleteDoc(doc(db, 'shared_debts', debtId));
+        const delPromise = deleteDoc(doc(db, 'muzi_debts_v4', debtId));
         const timeout = new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000));
         await Promise.race([delPromise, timeout]);
         showToast('🗑️ 項目已成功刪除！', 'success');
@@ -210,13 +229,10 @@ export default function App() {
       paidPeriods: [] 
     };
 
-    // 獨立出一個背景執行的函數，不讓 await 卡住畫面
     const syncToCloud = async () => {
       try {
-        const savePromise = setDoc(doc(db, 'shared_debts', targetId), debtData, { merge: true });
-        // 設定 8 秒超時警告
+        const savePromise = setDoc(doc(db, 'muzi_debts_v4', targetId), debtData, { merge: true });
         const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000));
-        
         await Promise.race([savePromise, timeoutPromise]);
         showToast(isEdit ? '✏️ 修改成功！已同步給對方' : '🎉 新增成功！對方已可看見', 'success');
       } catch (err) {
@@ -229,11 +245,7 @@ export default function App() {
       }
     };
 
-    // 發射到背景同步
     syncToCloud();
-      
-    // 🚀 核心修復：不管網路快慢，畫面「瞬間」切回列表並清空表單！
-    // (Firebase 的本機快取機制會接管，讓新增的資料瞬間出現在列表中)
     setActiveTab('list');
     resetForm();
   };
@@ -282,18 +294,24 @@ export default function App() {
             <div className="flex flex-col">
               <span>穆子李記帳本</span>
               {/* ⭐ 確認更新成功的視覺標籤 ⭐ */}
-              <span className="text-[10px] bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full font-bold w-fit mt-0.5 border border-blue-200">v3.0 極速版</span>
+              <span className="text-[10px] bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full font-bold w-fit mt-0.5 border border-blue-200">v4.0 絕對同步版</span>
             </div>
           </h1>
-          {/* 動態連線指示燈 */}
-          <div className={`flex items-center gap-1 text-xs font-bold px-2 py-1 rounded-full border shadow-sm transition-colors ${
-            syncStatus === 'synced' ? 'text-green-500 bg-green-50 border-green-200' :
-            syncStatus === 'connecting' ? 'text-yellow-500 bg-yellow-50 border-yellow-200' :
-            'text-red-500 bg-red-50 border-red-200'
-          }`}>
-            {syncStatus === 'synced' ? <><CloudLightning size={14} className="fill-green-500" /> 已連線</> :
-             syncStatus === 'connecting' ? <><Loader2 size={14} className="animate-spin" /> 連線中</> :
-             <><WifiOff size={14} /> 雲端斷線</>}
+          <div className="flex flex-col items-end gap-1">
+            {/* 動態連線指示燈 */}
+            <div className={`flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border shadow-sm transition-colors ${
+              syncStatus === 'synced' ? 'text-green-500 bg-green-50 border-green-200' :
+              syncStatus === 'connecting' ? 'text-yellow-500 bg-yellow-50 border-yellow-200' :
+              'text-red-500 bg-red-50 border-red-200'
+            }`}>
+              {syncStatus === 'synced' ? <><CloudLightning size={12} className="fill-green-500" /> 已連線</> :
+              syncStatus === 'connecting' ? <><Loader2 size={12} className="animate-spin" /> 連線中</> :
+              <><WifiOff size={12} /> 雲端斷線</>}
+            </div>
+            {/* 手動強制重整按鈕 */}
+            <button onClick={() => window.location.reload(true)} className="flex items-center gap-1 text-[10px] bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full hover:bg-slate-300">
+              <RefreshCw size={10} /> 強制重整
+            </button>
           </div>
         </header>
 
