@@ -46,14 +46,12 @@ export default function App() {
   const [debts, setDebts] = useState([]);
   const [user, setUser] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [isSubmitting, setIsSubmitting] = useState(false); // 新增：防連點機制
   const [dbError, setDbError] = useState(null); 
   const [syncStatus, setSyncStatus] = useState('connecting');
   
-  // 新增：美觀的浮動通知系統
-  const [toast, setToast] = useState(null); // { message: '', type: 'success' | 'error' }
+  // 美觀的浮動通知系統
+  const [toast, setToast] = useState(null);
 
-  // 表單狀態
   const [formName, setFormName] = useState('');
   const [formAmount, setFormAmount] = useState('');
   const [formPeriods, setFormPeriods] = useState(12);
@@ -63,7 +61,7 @@ export default function App() {
   // 顯示通知的函數
   const showToast = (message, type = 'success') => {
     setToast({ message, type });
-    setTimeout(() => setToast(null), 3000); // 3秒後自動消失
+    setTimeout(() => setToast(null), 3500); // 3.5秒後自動消失
   };
 
   // 自動匿名登入
@@ -98,7 +96,7 @@ export default function App() {
       
       const loadedDebts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       loadedDebts.sort((a, b) => Number(a.id) - Number(b.id)); // 依建立時間排序
-      setDebts(loadedDebts); // 只有當雲端真的有資料時，畫面才會更新！
+      setDebts(loadedDebts); // Firebase 本機快取會瞬間觸發此處，讓畫面瞬間更新
       setIsLoading(false);
     }, (error) => {
       console.error("Firebase 連線錯誤:", error);
@@ -132,8 +130,8 @@ export default function App() {
 
   const { totalDebt, totalPaid, outstandingBalance } = calculateDebtStats();
 
-  // 打勾繳款
-  const togglePaidStatus = async (debtId, periodIndex) => {
+  // 🟢 極速版：打勾繳款 (瞬間背景執行)
+  const togglePaidStatus = (debtId, periodIndex) => {
     const debt = debts.find(d => d.id === debtId);
     if (!debt) return;
     
@@ -142,25 +140,36 @@ export default function App() {
       ? debt.paidPeriods.filter(i => i !== periodIndex) 
       : [...debt.paidPeriods, periodIndex];
     
-    try {
-      // 等待真正寫入雲端
-      await setDoc(doc(db, 'shared_debts', debtId), { ...debt, paidPeriods: newPaidPeriods }, { merge: true });
-      if (!isPaid) showToast('✅ 繳款紀錄已同步！', 'success');
-    } catch (err) {
-      showToast("⚠️ 網路不穩，打勾失敗請重試！", 'error');
-    }
+    const syncUpdate = async () => {
+      try {
+        const savePromise = setDoc(doc(db, 'shared_debts', debtId), { ...debt, paidPeriods: newPaidPeriods }, { merge: true });
+        const timeout = new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000));
+        await Promise.race([savePromise, timeout]);
+        if (!isPaid) showToast('✅ 繳款紀錄已同步！對方已可看見', 'success');
+      } catch (err) {
+        showToast("⚠️ 網路不穩，打勾狀態將在背景重試", 'error');
+      }
+    };
+    
+    syncUpdate(); // 直接丟去背景跑，畫面瞬間打勾
   };
 
-  // 刪除項目
-  const handleDeleteDebt = async (debtId) => {
+  // 🟢 極速版：刪除項目 (瞬間背景執行)
+  const handleDeleteDebt = (debtId) => {
     if (!window.confirm('確定要刪除這筆帳目嗎？(刪除後將無法復原)')) return;
     
-    try {
-      await deleteDoc(doc(db, 'shared_debts', debtId));
-      showToast('🗑️ 項目已成功刪除！', 'success');
-    } catch (err) {
-      showToast("⚠️ 刪除失敗！請檢查網路連線", 'error');
-    }
+    const syncDelete = async () => {
+      try {
+        const delPromise = deleteDoc(doc(db, 'shared_debts', debtId));
+        const timeout = new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000));
+        await Promise.race([delPromise, timeout]);
+        showToast('🗑️ 項目已成功刪除！', 'success');
+      } catch (err) {
+        showToast("⚠️ 刪除指令將在網路恢復時完成", 'error');
+      }
+    };
+
+    syncDelete();
   };
 
   // 進入編輯模式
@@ -174,50 +183,59 @@ export default function App() {
     setActiveTab('add');
   };
 
-  // 儲存/新增項目 (包含嚴格的等待機制)
-  const handleSaveDebt = async () => {
+  // 🟢 極速版：儲存/新增項目 (瞬間切換畫面 + 背景同步)
+  const handleSaveDebt = () => {
     if (!formName || !formAmount || !formStartDate) {
       showToast('請填寫完整資訊！', 'error');
       return;
     }
     
-    setIsSubmitting(true); // 按鈕鎖定轉圈圈
     const [year, month] = formStartDate.split('-');
+    const isEdit = !!editingId;
+    const targetId = editingId || Date.now().toString();
     
-    try {
-      if (editingId) {
-        const updatedDebtData = { 
-          name: formName, 
-          totalAmount: Number(formAmount), 
-          periods: Number(formPeriods), 
-          startYear: Number(year), 
-          startMonth: Number(month)
-        };
-        await setDoc(doc(db, 'shared_debts', editingId), updatedDebtData, { merge: true });
-        showToast('✏️ 修改成功！已同步給對方', 'success');
-      } else {
-        const newId = Date.now().toString();
-        const newDebt = { 
-          id: newId, 
-          name: formName, 
-          totalAmount: Number(formAmount), 
-          periods: Number(formPeriods), 
-          startYear: Number(year), 
-          startMonth: Number(month), 
-          paidPeriods: [] 
-        };
-        await setDoc(doc(db, 'shared_debts', newId), newDebt);
-        showToast('🎉 新增成功！對方已可看見', 'success');
+    const debtData = isEdit ? { 
+      name: formName, 
+      totalAmount: Number(formAmount), 
+      periods: Number(formPeriods), 
+      startYear: Number(year), 
+      startMonth: Number(month)
+    } : {
+      id: targetId, 
+      name: formName, 
+      totalAmount: Number(formAmount), 
+      periods: Number(formPeriods), 
+      startYear: Number(year), 
+      startMonth: Number(month), 
+      paidPeriods: [] 
+    };
+
+    // 獨立出一個背景執行的函數，不讓 await 卡住畫面
+    const syncToCloud = async () => {
+      try {
+        const savePromise = setDoc(doc(db, 'shared_debts', targetId), debtData, { merge: true });
+        // 設定 8 秒超時警告
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000));
+        
+        await Promise.race([savePromise, timeoutPromise]);
+        showToast(isEdit ? '✏️ 修改成功！已同步給對方' : '🎉 新增成功！對方已可看見', 'success');
+      } catch (err) {
+        console.error(err);
+        if (err.message === 'timeout') {
+          showToast("⚠️ 網路似乎偏慢，資料將在背景持續重試同步！", 'error');
+        } else {
+          showToast("⚠️ 雲端儲存發生異常", 'error');
+        }
       }
+    };
+
+    // 發射到背景同步
+    syncToCloud();
       
-      setActiveTab('list');
-      resetForm();
-    } catch (err) {
-      console.error(err);
-      showToast("⚠️ 雲端儲存失敗！資料未送出，請檢查網路", 'error');
-    } finally {
-      setIsSubmitting(false); // 解除按鈕鎖定
-    }
+    // 🚀 核心修復：不管網路快慢，畫面「瞬間」切回列表並清空表單！
+    // (Firebase 的本機快取機制會接管，讓新增的資料瞬間出現在列表中)
+    setActiveTab('list');
+    resetForm();
   };
 
   const handleCancelEdit = () => {
@@ -236,12 +254,12 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-100 font-sans flex justify-center">
       
-      {/* 🟢 新增：浮動通知中心 (Toast) */}
+      {/* 🟢 浮動通知中心 (Toast) */}
       {toast && (
-        <div className={`fixed top-20 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-full shadow-lg font-bold text-sm flex items-center gap-2 animate-bounce transition-all ${
+        <div className={`fixed top-20 left-1/2 -translate-x-1/2 z-50 px-6 py-4 rounded-full shadow-2xl font-bold text-sm flex items-center gap-3 animate-bounce transition-all whitespace-nowrap ${
           toast.type === 'error' ? 'bg-red-500 text-white shadow-red-500/30' : 'bg-slate-800 text-white shadow-slate-800/30'
         }`}>
-          {toast.type === 'error' ? <AlertCircle size={18} /> : <CheckCircle2 size={18} className="text-green-400" />}
+          {toast.type === 'error' ? <AlertCircle size={20} /> : <CheckCircle2 size={20} className="text-green-400" />}
           {toast.message}
         </div>
       )}
@@ -261,7 +279,11 @@ export default function App() {
         <header className="bg-white px-6 py-4 flex justify-between items-center shadow-sm sticky top-0 z-10">
           <h1 className="text-xl font-black text-slate-800 flex items-center gap-2 tracking-wide">
             <div className="bg-slate-800 text-white p-1.5 rounded-lg"><Users size={20} /></div>
-            穆子李記帳本
+            <div className="flex flex-col">
+              <span>穆子李記帳本</span>
+              {/* ⭐ 確認更新成功的視覺標籤 ⭐ */}
+              <span className="text-[10px] bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full font-bold w-fit mt-0.5 border border-blue-200">v3.0 極速版</span>
+            </div>
           </h1>
           {/* 動態連線指示燈 */}
           <div className={`flex items-center gap-1 text-xs font-bold px-2 py-1 rounded-full border shadow-sm transition-colors ${
@@ -409,18 +431,16 @@ export default function App() {
               
               <div className="flex gap-3 mt-auto">
                 {editingId && (
-                  <button onClick={handleCancelEdit} disabled={isSubmitting} className="w-1/3 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-4 rounded-xl shadow-sm transition-colors disabled:opacity-50">
+                  <button onClick={handleCancelEdit} className="w-1/3 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-4 rounded-xl shadow-sm transition-colors">
                     取消
                   </button>
                 )}
-                {/* 🟢 修改：防連點與轉圈圈動畫按鈕 */}
                 <button 
                   onClick={handleSaveDebt} 
-                  disabled={isSubmitting}
-                  className="flex-1 bg-slate-800 hover:bg-slate-900 text-white font-bold py-4 rounded-xl shadow-lg transition-colors flex justify-center items-center gap-2 disabled:bg-slate-500 disabled:cursor-not-allowed"
+                  className="flex-1 bg-slate-800 hover:bg-slate-900 text-white font-bold py-4 rounded-xl shadow-lg transition-colors flex justify-center items-center gap-2"
                 >
-                  {isSubmitting ? <Loader2 size={20} className="animate-spin" /> : (editingId ? <CheckCircle2 size={20} /> : <PlusCircle size={20} />)} 
-                  {isSubmitting ? '雲端連線中...' : (editingId ? '儲存修改' : '新增雲端項目')}
+                  {editingId ? <CheckCircle2 size={20} /> : <PlusCircle size={20} />} 
+                  {editingId ? '儲存修改' : '新增雲端項目'}
                 </button>
               </div>
             </div>
