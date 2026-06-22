@@ -12,7 +12,10 @@ import {
   CloudLightning,
   Loader2,
   Trash2,
-  Edit
+  Edit,
+  WifiOff,
+  Database,
+  AlertCircle
 } from 'lucide-react';
 
 // --- Firebase 雲端資料庫模組 ---
@@ -38,27 +41,30 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// 預設的 PDF 帳本資料
-const pdfImportData = [
-  { id: '1700000000001', name: '溫拿保險', totalAmount: 14966, periods: 12, startYear: 2025, startMonth: 12, paidPeriods: [0, 1, 2, 3, 4, 5] },
-  { id: '1700000000002', name: '溫拿稅金', totalAmount: 7120, periods: 12, startYear: 2025, startMonth: 12, paidPeriods: [0, 1, 2, 3, 4, 5] },
-  { id: '1700000000003', name: '烏冬保險', totalAmount: 6996, periods: 12, startYear: 2025, startMonth: 12, paidPeriods: [0, 1, 2, 3, 4, 5] },
-  { id: '1700000000004', name: '溫拿保養', totalAmount: 9417, periods: 6, startYear: 2026, startMonth: 1, paidPeriods: [0] }
-];
-
 export default function App() {
   const [activeTab, setActiveTab] = useState('list');
   const [debts, setDebts] = useState([]);
   const [user, setUser] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [authError, setAuthError] = useState(null);
+  const [isSubmitting, setIsSubmitting] = useState(false); // 新增：防連點機制
+  const [dbError, setDbError] = useState(null); 
+  const [syncStatus, setSyncStatus] = useState('connecting');
+  
+  // 新增：美觀的浮動通知系統
+  const [toast, setToast] = useState(null); // { message: '', type: 'success' | 'error' }
 
   // 表單狀態
   const [formName, setFormName] = useState('');
   const [formAmount, setFormAmount] = useState('');
   const [formPeriods, setFormPeriods] = useState(12);
   const [formStartDate, setFormStartDate] = useState('');
-  const [editingId, setEditingId] = useState(null); // 用來判斷目前是否在「編輯模式」
+  const [editingId, setEditingId] = useState(null); 
+
+  // 顯示通知的函數
+  const showToast = (message, type = 'success') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 3000); // 3秒後自動消失
+  };
 
   // 自動匿名登入
   useEffect(() => {
@@ -66,12 +72,8 @@ export default function App() {
       try {
         await signInAnonymously(auth);
       } catch (error) {
-        console.error("登入錯誤:", error);
-        if (error.code === 'auth/configuration-not-found' || error.code === 'auth/operation-not-allowed') {
-          setAuthError("請至 Firebase 開啟匿名登入權限！");
-        } else {
-          setAuthError(`驗證錯誤: ${error.message}`);
-        }
+        setDbError("無法驗證身分！請確認已在 Firebase 啟用「匿名登入」。");
+        setSyncStatus('error');
         setIsLoading(false);
       }
     };
@@ -84,27 +86,29 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // 即時監聽資料庫
+  // 即時監聽資料庫 (這裡會自動同步所有人的變更)
   useEffect(() => {
     if (!user) return;
+    setSyncStatus('connecting');
     const debtsRef = collection(db, 'shared_debts');
     
-    const unsubscribe = onSnapshot(debtsRef, async (snapshot) => {
-      if (snapshot.empty) {
-        setIsLoading(true);
-        for (const debt of pdfImportData) {
-          const debtDoc = doc(db, 'shared_debts', debt.id);
-          await setDoc(debtDoc, debt);
-        }
-      } else {
-        const loadedDebts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        loadedDebts.sort((a, b) => Number(a.id) - Number(b.id)); // 依建立時間排序
-        setDebts(loadedDebts);
-        setIsLoading(false);
-      }
-    }, (error) => {
-      console.error("讀取資料失敗:", error);
+    const unsubscribe = onSnapshot(debtsRef, (snapshot) => {
+      setSyncStatus('synced');
+      setDbError(null);
+      
+      const loadedDebts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      loadedDebts.sort((a, b) => Number(a.id) - Number(b.id)); // 依建立時間排序
+      setDebts(loadedDebts); // 只有當雲端真的有資料時，畫面才會更新！
       setIsLoading(false);
+    }, (error) => {
+      console.error("Firebase 連線錯誤:", error);
+      setSyncStatus('error');
+      setIsLoading(false);
+      if (error.code === 'permission-denied') {
+        setDbError("無法連線雲端資料庫！請去 Firebase 建立 Firestore 資料庫，並將規則設定為「測試模式」(Test mode)。");
+      } else {
+        setDbError(`雲端連線失敗: ${error.message}`);
+      }
     });
     
     return () => unsubscribe();
@@ -128,6 +132,7 @@ export default function App() {
 
   const { totalDebt, totalPaid, outstandingBalance } = calculateDebtStats();
 
+  // 打勾繳款
   const togglePaidStatus = async (debtId, periodIndex) => {
     const debt = debts.find(d => d.id === debtId);
     if (!debt) return;
@@ -137,97 +142,84 @@ export default function App() {
       ? debt.paidPeriods.filter(i => i !== periodIndex) 
       : [...debt.paidPeriods, periodIndex];
     
-    setDebts(debts.map(d => d.id === debtId ? { ...d, paidPeriods: newPaidPeriods } : d));
-    
     try {
-      const debtDoc = doc(db, 'shared_debts', debtId);
-      await setDoc(debtDoc, { ...debt, paidPeriods: newPaidPeriods }, { merge: true });
+      // 等待真正寫入雲端
+      await setDoc(doc(db, 'shared_debts', debtId), { ...debt, paidPeriods: newPaidPeriods }, { merge: true });
+      if (!isPaid) showToast('✅ 繳款紀錄已同步！', 'success');
     } catch (err) {
-      console.error("更新狀態失敗:", err);
-      alert("網路異常，請確認連線。");
+      showToast("⚠️ 網路不穩，打勾失敗請重試！", 'error');
     }
   };
 
-  // 🗑️ 刪除項目功能
+  // 刪除項目
   const handleDeleteDebt = async (debtId) => {
     if (!window.confirm('確定要刪除這筆帳目嗎？(刪除後將無法復原)')) return;
     
-    // 先在畫面上移除，體驗更流暢
-    setDebts(debts.filter(d => d.id !== debtId));
-    
     try {
       await deleteDoc(doc(db, 'shared_debts', debtId));
+      showToast('🗑️ 項目已成功刪除！', 'success');
     } catch (err) {
-      console.error("刪除失敗:", err);
-      alert("刪除失敗，請檢查網路連線。");
+      showToast("⚠️ 刪除失敗！請檢查網路連線", 'error');
     }
   };
 
-  // ✏️ 點擊編輯：將資料載入表單
+  // 進入編輯模式
   const handleEditDebt = (debt) => {
     setFormName(debt.name);
     setFormAmount(debt.totalAmount.toString());
     setFormPeriods(debt.periods);
     const monthStr = String(debt.startMonth).padStart(2, '0');
     setFormStartDate(`${debt.startYear}-${monthStr}`);
-    setEditingId(debt.id); // 標記目前正在編輯的 ID
-    setActiveTab('add');   // 自動切換到表單分頁
+    setEditingId(debt.id);
+    setActiveTab('add');
   };
 
-  // 💾 儲存項目 (包含新增與修改)
+  // 儲存/新增項目 (包含嚴格的等待機制)
   const handleSaveDebt = async () => {
     if (!formName || !formAmount || !formStartDate) {
-      alert('請填寫完整資訊！');
+      showToast('請填寫完整資訊！', 'error');
       return;
     }
     
+    setIsSubmitting(true); // 按鈕鎖定轉圈圈
     const [year, month] = formStartDate.split('-');
     
-    if (editingId) {
-      // 處理「修改」邏輯
-      const updatedDebtData = { 
-        name: formName, 
-        totalAmount: Number(formAmount), 
-        periods: Number(formPeriods), 
-        startYear: Number(year), 
-        startMonth: Number(month)
-      };
-      
-      setDebts(debts.map(d => d.id === editingId ? { ...d, ...updatedDebtData } : d));
-      
-      try {
+    try {
+      if (editingId) {
+        const updatedDebtData = { 
+          name: formName, 
+          totalAmount: Number(formAmount), 
+          periods: Number(formPeriods), 
+          startYear: Number(year), 
+          startMonth: Number(month)
+        };
         await setDoc(doc(db, 'shared_debts', editingId), updatedDebtData, { merge: true });
-      } catch (err) {
-        console.error("更新資料失敗:", err);
-      }
-    } else {
-      // 處理「新增」邏輯
-      const newId = Date.now().toString();
-      const newDebt = { 
-        id: newId, 
-        name: formName, 
-        totalAmount: Number(formAmount), 
-        periods: Number(formPeriods), 
-        startYear: Number(year), 
-        startMonth: Number(month), 
-        paidPeriods: [] 
-      };
-      
-      setDebts([...debts, newDebt]);
-      
-      try {
+        showToast('✏️ 修改成功！已同步給對方', 'success');
+      } else {
+        const newId = Date.now().toString();
+        const newDebt = { 
+          id: newId, 
+          name: formName, 
+          totalAmount: Number(formAmount), 
+          periods: Number(formPeriods), 
+          startYear: Number(year), 
+          startMonth: Number(month), 
+          paidPeriods: [] 
+        };
         await setDoc(doc(db, 'shared_debts', newId), newDebt);
-      } catch (err) {
-        console.error("新增資料失敗:", err);
+        showToast('🎉 新增成功！對方已可看見', 'success');
       }
+      
+      setActiveTab('list');
+      resetForm();
+    } catch (err) {
+      console.error(err);
+      showToast("⚠️ 雲端儲存失敗！資料未送出，請檢查網路", 'error');
+    } finally {
+      setIsSubmitting(false); // 解除按鈕鎖定
     }
-
-    // 儲存後清空表單，切換回列表
-    setActiveTab('list');
-    resetForm();
   };
 
-  // 取消編輯，清空表單
   const handleCancelEdit = () => {
     setActiveTab('list');
     resetForm();
@@ -243,21 +235,27 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-100 font-sans flex justify-center">
-      {authError && (
+      
+      {/* 🟢 新增：浮動通知中心 (Toast) */}
+      {toast && (
+        <div className={`fixed top-20 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-full shadow-lg font-bold text-sm flex items-center gap-2 animate-bounce transition-all ${
+          toast.type === 'error' ? 'bg-red-500 text-white shadow-red-500/30' : 'bg-slate-800 text-white shadow-slate-800/30'
+        }`}>
+          {toast.type === 'error' ? <AlertCircle size={18} /> : <CheckCircle2 size={18} className="text-green-400" />}
+          {toast.message}
+        </div>
+      )}
+
+      {/* 嚴重錯誤阻擋畫面 */}
+      {dbError && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-100/90 backdrop-blur-sm p-6">
           <div className="bg-white p-6 rounded-2xl shadow-xl max-w-sm w-full border-t-4 border-red-500">
-            <h2 className="text-xl font-bold text-slate-800 mb-3">Oops! 雲端設定還差一步</h2>
-            <p className="text-slate-600 mb-4 text-sm font-medium">{authError}</p>
-            <div className="text-left text-xs text-slate-500 bg-slate-50 p-4 rounded-lg border border-slate-200 leading-relaxed">
-              1. 回到 Firebase 左側選單點擊 <b>建構</b> {'>'} <b>Authentication</b><br/>
-              2. 點擊畫面上的 <b>開始使用</b><br/>
-              3. 在 <b>Sign-in method (登入方式)</b> 中找到 <b>匿名 (Anonymous)</b><br/>
-              4. 點擊啟用並 <b>儲存</b><br/>
-              5. 重新整理這個網頁！
-            </div>
+            <h2 className="text-xl font-bold text-red-600 mb-3 flex items-center gap-2"><Database /> 雲端資料庫未就緒</h2>
+            <p className="text-slate-600 mb-4 text-sm font-medium leading-relaxed">{dbError}</p>
           </div>
         </div>
       )}
+
       <div className="w-full max-w-md bg-slate-100 min-h-screen relative shadow-2xl flex flex-col">
         {/* 頂部標題 */}
         <header className="bg-white px-6 py-4 flex justify-between items-center shadow-sm sticky top-0 z-10">
@@ -265,8 +263,15 @@ export default function App() {
             <div className="bg-slate-800 text-white p-1.5 rounded-lg"><Users size={20} /></div>
             穆子李記帳本
           </h1>
-          <div className="flex items-center gap-1 text-xs font-bold text-green-500 bg-green-50 px-2 py-1 rounded-full border border-green-200 shadow-sm">
-             <CloudLightning size={14} className="fill-green-500" /> 專屬雲端
+          {/* 動態連線指示燈 */}
+          <div className={`flex items-center gap-1 text-xs font-bold px-2 py-1 rounded-full border shadow-sm transition-colors ${
+            syncStatus === 'synced' ? 'text-green-500 bg-green-50 border-green-200' :
+            syncStatus === 'connecting' ? 'text-yellow-500 bg-yellow-50 border-yellow-200' :
+            'text-red-500 bg-red-50 border-red-200'
+          }`}>
+            {syncStatus === 'synced' ? <><CloudLightning size={14} className="fill-green-500" /> 已連線</> :
+             syncStatus === 'connecting' ? <><Loader2 size={14} className="animate-spin" /> 連線中</> :
+             <><WifiOff size={14} /> 雲端斷線</>}
           </div>
         </header>
 
@@ -294,7 +299,10 @@ export default function App() {
               <div className="space-y-4">
                 <h2 className="text-lg font-bold text-slate-800 px-1 border-l-4 border-blue-500 pl-2">還款分期明細</h2>
                 {debts.length === 0 ? (
-                  <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-8 text-center text-slate-400">目前沒有任何紀錄。</div>
+                  <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-8 text-center text-slate-400 flex flex-col items-center justify-center">
+                    <Database size={40} className="text-slate-200 mb-3" />
+                    資料庫是空的。<br/>點擊下方「新增項目」開始記帳吧！
+                  </div>
                 ) : debts.map(debt => {
                   const monthlyTotal = Math.round(debt.totalAmount / debt.periods);
                   const perPersonMonthly = Math.round(monthlyTotal / 2);
@@ -304,7 +312,6 @@ export default function App() {
                         <div>
                           <div className="flex items-center gap-2">
                             <h3 className="font-bold text-lg text-slate-800">{debt.name}</h3>
-                            {/* 新增的編輯與刪除按鈕 */}
                             <button onClick={() => handleEditDebt(debt)} className="text-slate-400 hover:text-blue-500 transition-colors p-1">
                               <Edit size={16} />
                             </button>
@@ -402,13 +409,18 @@ export default function App() {
               
               <div className="flex gap-3 mt-auto">
                 {editingId && (
-                  <button onClick={handleCancelEdit} className="w-1/3 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-4 rounded-xl shadow-sm transition-colors">
+                  <button onClick={handleCancelEdit} disabled={isSubmitting} className="w-1/3 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-4 rounded-xl shadow-sm transition-colors disabled:opacity-50">
                     取消
                   </button>
                 )}
-                <button onClick={handleSaveDebt} className="flex-1 bg-slate-800 hover:bg-slate-900 text-white font-bold py-4 rounded-xl shadow-lg transition-colors flex justify-center items-center gap-2">
-                  {editingId ? <CheckCircle2 size={20} /> : <PlusCircle size={20} />} 
-                  {editingId ? '儲存修改' : '新增雲端項目'}
+                {/* 🟢 修改：防連點與轉圈圈動畫按鈕 */}
+                <button 
+                  onClick={handleSaveDebt} 
+                  disabled={isSubmitting}
+                  className="flex-1 bg-slate-800 hover:bg-slate-900 text-white font-bold py-4 rounded-xl shadow-lg transition-colors flex justify-center items-center gap-2 disabled:bg-slate-500 disabled:cursor-not-allowed"
+                >
+                  {isSubmitting ? <Loader2 size={20} className="animate-spin" /> : (editingId ? <CheckCircle2 size={20} /> : <PlusCircle size={20} />)} 
+                  {isSubmitting ? '雲端連線中...' : (editingId ? '儲存修改' : '新增雲端項目')}
                 </button>
               </div>
             </div>
