@@ -16,7 +16,9 @@ import {
   WifiOff,
   Database,
   AlertCircle,
-  RefreshCw
+  RefreshCw,
+  History,
+  BarChart3
 } from 'lucide-react';
 
 // --- Firebase 雲端資料庫模組 ---
@@ -42,7 +44,7 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// 預設的帳本資料 (用來確保資料庫有東西)
+// 預設的帳本資料
 const pdfImportData = [
   { id: '1700000000001', name: '溫拿保險', totalAmount: 14966, periods: 12, startYear: 2025, startMonth: 12, paidPeriods: [0, 1, 2, 3, 4, 5] },
   { id: '1700000000002', name: '溫拿稅金', totalAmount: 7120, periods: 12, startYear: 2025, startMonth: 12, paidPeriods: [0, 1, 2, 3, 4, 5] },
@@ -51,14 +53,12 @@ const pdfImportData = [
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('list');
+  const [activeTab, setActiveTab] = useState('list'); // list, history, add
   const [debts, setDebts] = useState([]);
   const [user, setUser] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [dbError, setDbError] = useState(null); 
   const [syncStatus, setSyncStatus] = useState('connecting');
-  
-  // 美觀的浮動通知系統
   const [toast, setToast] = useState(null);
 
   const [formName, setFormName] = useState('');
@@ -67,13 +67,11 @@ export default function App() {
   const [formStartDate, setFormStartDate] = useState('');
   const [editingId, setEditingId] = useState(null); 
 
-  // 顯示通知的函數
   const showToast = (message, type = 'success') => {
     setToast({ message, type });
-    setTimeout(() => setToast(null), 3500); // 3.5秒後自動消失
+    setTimeout(() => setToast(null), 3500); 
   };
 
-  // 自動匿名登入
   useEffect(() => {
     const initAuth = async () => {
       try {
@@ -85,7 +83,6 @@ export default function App() {
       }
     };
     initAuth();
-
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
       if (!currentUser) setIsLoading(false);
@@ -93,27 +90,31 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // 即時監聽資料庫 (這裡會自動同步所有人的變更)
   useEffect(() => {
     if (!user) return;
     setSyncStatus('connecting');
-    // ⚠️ 關鍵更新：換一個全新的資料庫頻道，避免與舊資料卡住衝突
-    const debtsRef = collection(db, 'muzi_debts_v4');
+    const debtsRef = collection(db, 'muzi_debts_v5');
     
     const unsubscribe = onSnapshot(debtsRef, async (snapshot) => {
       setSyncStatus('synced');
       setDbError(null);
       
-      // 如果發現新頻道是空的，自動幫您塞入基礎資料，確認連線暢通！
       if (snapshot.empty) {
         setIsLoading(true);
-        for (const debt of pdfImportData) {
-          const debtDoc = doc(db, 'muzi_debts_v4', debt.id);
-          await setDoc(debtDoc, debt);
+        try {
+          for (const debt of pdfImportData) {
+            const debtDoc = doc(db, 'muzi_debts_v5', debt.id);
+            await setDoc(debtDoc, debt);
+          }
+        } catch (err) {
+          console.error("寫入初始資料失敗:", err);
+          setDbError(`【資料庫權限鎖死】您的 Firebase 拒絕了寫入請求！請前往 Firebase -> Firestore Database -> 規則 (Rules)，將規則改為 allow read, write: if true;`);
+          setSyncStatus('error');
+          setIsLoading(false);
         }
       } else {
         const loadedDebts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        loadedDebts.sort((a, b) => Number(a.id) - Number(b.id)); // 依建立時間排序
+        loadedDebts.sort((a, b) => Number(a.id) - Number(b.id)); 
         setDebts(loadedDebts); 
         setIsLoading(false);
       }
@@ -122,7 +123,7 @@ export default function App() {
       setSyncStatus('error');
       setIsLoading(false);
       if (error.code === 'permission-denied') {
-        setDbError("無法連線雲端資料庫！請去 Firebase 建立 Firestore 資料庫，並將規則設定為「測試模式」(Test mode)。");
+        setDbError("【權限被拒絕】無法連線雲端資料庫！請去 Firebase 建立 Firestore Database，並確認「規則」已設定為允許讀寫。");
       } else {
         setDbError(`雲端連線失敗: ${error.message}`);
       }
@@ -136,6 +137,11 @@ export default function App() {
     return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}`;
   };
 
+  // 整理分類資料：進行中 vs 已完成 (歷史資料)
+  const activeDebts = debts.filter(debt => debt.paidPeriods.length < debt.periods);
+  const completedDebts = debts.filter(debt => debt.paidPeriods.length === debt.periods);
+
+  // 總計資料計算
   const calculateDebtStats = () => {
     let totalDebt = 0;
     let totalPaid = 0;
@@ -149,7 +155,50 @@ export default function App() {
 
   const { totalDebt, totalPaid, outstandingBalance } = calculateDebtStats();
 
-  // 🟢 極速版：打勾繳款 (瞬間背景執行)
+  // 📊 計算未來 6 個月的預估每月負擔
+  const getUpcomingMonthsBurden = () => {
+    const burdens = [];
+    const today = new Date();
+    let currentYear = today.getFullYear();
+    let currentMonth = today.getMonth() + 1;
+
+    for (let i = 0; i < 6; i++) {
+      const targetAbsMonth = currentYear * 12 + currentMonth;
+      let monthTotal = 0;
+
+      activeDebts.forEach(debt => {
+        const debtStartAbs = debt.startYear * 12 + debt.startMonth;
+        const debtEndAbs = debtStartAbs + debt.periods - 1;
+
+        // 如果這個月落在該項目的分期區間內
+        if (targetAbsMonth >= debtStartAbs && targetAbsMonth <= debtEndAbs) {
+          const periodIndex = targetAbsMonth - debtStartAbs;
+          // 且該月還沒繳款
+          if (!debt.paidPeriods.includes(periodIndex)) {
+            const perPerson = Math.round((debt.totalAmount / debt.periods) / 2);
+            monthTotal += perPerson;
+          }
+        }
+      });
+
+      burdens.push({
+        label: i === 0 ? '本月' : `${currentMonth}月`,
+        fullLabel: `${currentYear}/${String(currentMonth).padStart(2, '0')}`,
+        amount: monthTotal
+      });
+
+      currentMonth++;
+      if (currentMonth > 12) {
+        currentMonth = 1;
+        currentYear++;
+      }
+    }
+    return burdens;
+  };
+
+  const upcomingBurdens = getUpcomingMonthsBurden();
+  const maxBurden = Math.max(...upcomingBurdens.map(b => b.amount), 1); // 避免除以 0
+
   const togglePaidStatus = (debtId, periodIndex) => {
     const debt = debts.find(d => d.id === debtId);
     if (!debt) return;
@@ -161,37 +210,38 @@ export default function App() {
     
     const syncUpdate = async () => {
       try {
-        const savePromise = setDoc(doc(db, 'muzi_debts_v4', debtId), { ...debt, paidPeriods: newPaidPeriods }, { merge: true });
+        const savePromise = setDoc(doc(db, 'muzi_debts_v5', debtId), { ...debt, paidPeriods: newPaidPeriods }, { merge: true });
         const timeout = new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000));
         await Promise.race([savePromise, timeout]);
-        if (!isPaid) showToast('✅ 繳款紀錄已同步！對方已可看見', 'success');
+        if (!isPaid) {
+          if (newPaidPeriods.length === debt.periods) {
+            showToast('🎉 恭喜！此項目已全數還清，移至歷史資料', 'success');
+          } else {
+            showToast('✅ 繳款紀錄已同步！', 'success');
+          }
+        }
       } catch (err) {
-        showToast("⚠️ 網路不穩，打勾狀態將在背景重試", 'error');
+        showToast("⚠️ 雲端拒絕寫入，請檢查 Firebase 規則！", 'error');
       }
     };
-    
-    syncUpdate(); // 直接丟去背景跑，畫面瞬間打勾
+    syncUpdate(); 
   };
 
-  // 🟢 極速版：刪除項目 (瞬間背景執行)
   const handleDeleteDebt = (debtId) => {
     if (!window.confirm('確定要刪除這筆帳目嗎？(刪除後將無法復原)')) return;
-    
     const syncDelete = async () => {
       try {
-        const delPromise = deleteDoc(doc(db, 'muzi_debts_v4', debtId));
+        const delPromise = deleteDoc(doc(db, 'muzi_debts_v5', debtId));
         const timeout = new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000));
         await Promise.race([delPromise, timeout]);
         showToast('🗑️ 項目已成功刪除！', 'success');
       } catch (err) {
-        showToast("⚠️ 刪除指令將在網路恢復時完成", 'error');
+        showToast("⚠️ 刪除失敗！權限不足或網路異常", 'error');
       }
     };
-
     syncDelete();
   };
 
-  // 進入編輯模式
   const handleEditDebt = (debt) => {
     setFormName(debt.name);
     setFormAmount(debt.totalAmount.toString());
@@ -202,7 +252,6 @@ export default function App() {
     setActiveTab('add');
   };
 
-  // 🟢 極速版：儲存/新增項目 (瞬間切換畫面 + 背景同步)
   const handleSaveDebt = () => {
     if (!formName || !formAmount || !formStartDate) {
       showToast('請填寫完整資訊！', 'error');
@@ -231,16 +280,15 @@ export default function App() {
 
     const syncToCloud = async () => {
       try {
-        const savePromise = setDoc(doc(db, 'muzi_debts_v4', targetId), debtData, { merge: true });
+        const savePromise = setDoc(doc(db, 'muzi_debts_v5', targetId), debtData, { merge: true });
         const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000));
         await Promise.race([savePromise, timeoutPromise]);
         showToast(isEdit ? '✏️ 修改成功！已同步給對方' : '🎉 新增成功！對方已可看見', 'success');
       } catch (err) {
-        console.error(err);
         if (err.message === 'timeout') {
           showToast("⚠️ 網路似乎偏慢，資料將在背景持續重試同步！", 'error');
         } else {
-          showToast("⚠️ 雲端儲存發生異常", 'error');
+          showToast("⚠️ 雲端儲存發生異常 (請檢查 Firebase 規則)", 'error');
         }
       }
     };
@@ -261,12 +309,76 @@ export default function App() {
     setFormPeriods(12); 
     setFormStartDate('');
     setEditingId(null);
-  }
+  };
+
+  // 共用的列表渲染元件
+  const renderDebtCard = (debt, isHistory = false) => {
+    const monthlyTotal = Math.round(debt.totalAmount / debt.periods);
+    const perPersonMonthly = Math.round(monthlyTotal / 2);
+    
+    return (
+      <div key={debt.id} className={`bg-white rounded-xl shadow-sm border overflow-hidden ${isHistory ? 'border-green-200' : 'border-slate-200'}`}>
+        <div className={`p-4 border-b flex justify-between items-start ${isHistory ? 'bg-green-50/50 border-green-100' : 'bg-slate-50 border-slate-100'}`}>
+          <div>
+            <div className="flex items-center gap-2">
+              <h3 className={`font-bold text-lg ${isHistory ? 'text-green-800' : 'text-slate-800'}`}>{debt.name}</h3>
+              {!isHistory && (
+                <button onClick={() => handleEditDebt(debt)} className="text-slate-400 hover:text-blue-500 transition-colors p-1"><Edit size={16} /></button>
+              )}
+              <button onClick={() => handleDeleteDebt(debt.id)} className="text-slate-400 hover:text-red-500 transition-colors p-1"><Trash2 size={16} /></button>
+            </div>
+            <p className="text-sm text-slate-500 mt-1">總額 NT${debt.totalAmount.toLocaleString()} • 分 {debt.periods} 期</p>
+          </div>
+          <div className={`${isHistory ? 'bg-green-100 text-green-800' : 'bg-blue-100 text-blue-800'} px-3 py-2 rounded-lg text-center shadow-inner`}>
+            <p className={`text-[10px] font-bold flex items-center justify-center gap-1 mb-1 ${isHistory ? 'text-green-600' : 'text-blue-600'}`}>
+              <Users size={12} /> 一人一月
+            </p>
+            <p className="text-xl font-black">NT${perPersonMonthly.toLocaleString()}</p>
+          </div>
+        </div>
+
+        <div className="p-4">
+          <div className="grid grid-cols-3 gap-3">
+            {Array.from({ length: debt.periods }).map((_, index) => {
+              const isPaid = debt.paidPeriods.includes(index);
+              const monthLabel = getMonthString(debt.startYear, debt.startMonth, index);
+              return (
+                <button key={index} onClick={() => togglePaidStatus(debt.id, index)} className={`flex items-center gap-2 p-2 rounded-md transition-colors border ${isPaid ? 'bg-green-50 border-green-200 text-green-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+                  {isPaid ? <CheckCircle2 size={18} className="text-green-500 flex-shrink-0" /> : <Circle size={18} className="text-slate-300 flex-shrink-0" />}
+                  <span className={`text-xs font-medium ${isPaid ? 'line-through opacity-70' : ''}`}>{monthLabel}</span>
+                </button>
+              );
+            })}
+          </div>
+          
+          <div className="mt-6 mb-2">
+            <div className="flex justify-between items-end mb-2">
+              <span className="text-xs font-bold text-slate-500 bg-slate-100 px-2 py-1 rounded-md">還款馬拉松</span>
+              <span className="text-xs text-slate-400 font-medium">{debt.paidPeriods.length} / {debt.periods} 期</span>
+            </div>
+            <div className={`text-[11px] sm:text-xs font-bold mb-4 py-2 px-1 rounded-lg text-center shadow-sm border whitespace-nowrap tracking-tight overflow-hidden ${isHistory ? 'bg-green-100 border-green-200 text-green-800' : 'bg-blue-50 border-blue-100 text-blue-700'}`}>
+              {debt.paidPeriods.length / debt.periods < 0.34 ? "🏃 起步：錢沒不見，只是變成你要的樣子！" : debt.paidPeriods.length / debt.periods < 0.67 ? "🐕 穩健：不知不覺已跨越三分之一，繼續保持！" : debt.paidPeriods.length / debt.periods < 1 ? "🔥 衝刺：快到終點了，未來的你會感謝努力的自己！" : "🎉 達陣：這場馬拉松順利完賽，給自己一個大擁抱！"}
+            </div>
+            <div className="flex items-center gap-2 relative h-12 px-1 mt-2">
+              <div className="w-8 h-8 flex items-center justify-center bg-white rounded-full shadow-md border border-slate-200 z-10 flex-shrink-0"><span className="text-lg">🚩</span></div>
+              <div className="flex-1 relative h-3 bg-slate-200 rounded-full shadow-inner">
+                <div className={`h-full rounded-full transition-all duration-1000 ease-out relative ${isHistory ? 'bg-green-500' : 'bg-gradient-to-r from-blue-400 to-indigo-500'}`} style={{ width: `${(debt.paidPeriods.length / debt.periods) * 100}%` }}>
+                  <div className="absolute right-0 top-1/2 -translate-y-[70%] translate-x-1/2 z-20 flex flex-col items-center">
+                    <div className="animate-bounce drop-shadow-md text-2xl" style={{ textShadow: '0 2px 4px rgba(0,0,0,0.2)' }}>🐶</div>
+                  </div>
+                </div>
+              </div>
+              <div className="w-8 h-8 flex items-center justify-center bg-white rounded-full shadow-md border border-slate-200 z-10 flex-shrink-0"><span className="text-lg">🏁</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-slate-100 font-sans flex justify-center">
       
-      {/* 🟢 浮動通知中心 (Toast) */}
       {toast && (
         <div className={`fixed top-20 left-1/2 -translate-x-1/2 z-50 px-6 py-4 rounded-full shadow-2xl font-bold text-sm flex items-center gap-3 animate-bounce transition-all whitespace-nowrap ${
           toast.type === 'error' ? 'bg-red-500 text-white shadow-red-500/30' : 'bg-slate-800 text-white shadow-slate-800/30'
@@ -276,7 +388,6 @@ export default function App() {
         </div>
       )}
 
-      {/* 嚴重錯誤阻擋畫面 */}
       {dbError && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-100/90 backdrop-blur-sm p-6">
           <div className="bg-white p-6 rounded-2xl shadow-xl max-w-sm w-full border-t-4 border-red-500">
@@ -287,18 +398,15 @@ export default function App() {
       )}
 
       <div className="w-full max-w-md bg-slate-100 min-h-screen relative shadow-2xl flex flex-col">
-        {/* 頂部標題 */}
         <header className="bg-white px-6 py-4 flex justify-between items-center shadow-sm sticky top-0 z-10">
           <h1 className="text-xl font-black text-slate-800 flex items-center gap-2 tracking-wide">
             <div className="bg-slate-800 text-white p-1.5 rounded-lg"><Users size={20} /></div>
             <div className="flex flex-col">
               <span>穆子李記帳本</span>
-              {/* ⭐ 確認更新成功的視覺標籤 ⭐ */}
-              <span className="text-[10px] bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full font-bold w-fit mt-0.5 border border-blue-200">v4.0 絕對同步版</span>
+              <span className="text-[10px] bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full font-bold w-fit mt-0.5 border border-blue-200">v6.0 歷史與圖表版</span>
             </div>
           </h1>
           <div className="flex flex-col items-end gap-1">
-            {/* 動態連線指示燈 */}
             <div className={`flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border shadow-sm transition-colors ${
               syncStatus === 'synced' ? 'text-green-500 bg-green-50 border-green-200' :
               syncStatus === 'connecting' ? 'text-yellow-500 bg-yellow-50 border-yellow-200' :
@@ -308,14 +416,12 @@ export default function App() {
               syncStatus === 'connecting' ? <><Loader2 size={12} className="animate-spin" /> 連線中</> :
               <><WifiOff size={12} /> 雲端斷線</>}
             </div>
-            {/* 手動強制重整按鈕 */}
             <button onClick={() => window.location.reload(true)} className="flex items-center gap-1 text-[10px] bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full hover:bg-slate-300">
               <RefreshCw size={10} /> 強制重整
             </button>
           </div>
         </header>
 
-        {/* 內容區域 */}
         <main className="flex-1 overflow-y-auto pb-24">
           {isLoading ? (
             <div className="flex flex-col items-center justify-center h-64 text-slate-400 gap-3">
@@ -330,81 +436,55 @@ export default function App() {
                 <p className="text-slate-300 text-sm font-medium mb-1 flex items-center gap-2"><CreditCard size={16} /> 目前總欠款餘額</p>
                 <h1 className="text-4xl font-bold mb-6 text-red-400 tracking-tight">NT${outstandingBalance.toLocaleString()}</h1>
                 <div className="flex justify-between border-t border-slate-700 pt-4">
-                  <div><p className="text-slate-400 text-xs mb-1">原始總欠款</p><p className="font-semibold">NT${totalDebt.toLocaleString()}</p></div>
+                  <div><p className="text-slate-400 text-xs mb-1">歷史總欠款</p><p className="font-semibold">NT${totalDebt.toLocaleString()}</p></div>
                   <div className="text-right"><p className="text-slate-400 text-xs mb-1">已共同還款</p><p className="font-semibold text-green-400">NT${totalPaid.toLocaleString()}</p></div>
                 </div>
               </div>
 
-              {/* 明細列表 */}
+              {/* 📊 新增：未來半年預估負擔長條圖 */}
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                <h2 className="text-sm font-bold text-slate-800 mb-4 flex items-center gap-2">
+                  <BarChart3 size={18} className="text-blue-500" /> 未來半年預估負擔 (每人/月)
+                </h2>
+                <div className="space-y-3">
+                  {upcomingBurdens.map((b, i) => (
+                    <div key={b.fullLabel} className="flex items-center gap-3">
+                      <span className="text-xs font-bold text-slate-500 w-8 text-right">{b.label}</span>
+                      <div className="flex-1 h-5 bg-slate-100 rounded-md overflow-hidden relative border border-slate-200">
+                        <div 
+                          className={`h-full rounded-md transition-all duration-1000 ${i === 0 ? 'bg-blue-500' : 'bg-blue-300'}`}
+                          style={{ width: `${(b.amount / maxBurden) * 100}%` }}
+                        />
+                      </div>
+                      <span className="text-xs font-bold text-slate-700 w-16 text-right">NT${b.amount.toLocaleString()}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* 進行中明細列表 */}
               <div className="space-y-4">
-                <h2 className="text-lg font-bold text-slate-800 px-1 border-l-4 border-blue-500 pl-2">還款分期明細</h2>
-                {debts.length === 0 ? (
+                <h2 className="text-lg font-bold text-slate-800 px-1 border-l-4 border-blue-500 pl-2">進行中項目</h2>
+                {activeDebts.length === 0 ? (
+                  <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-8 text-center text-slate-400 flex flex-col items-center justify-center">
+                    <CheckCircle2 size={40} className="text-green-300 mb-3" />
+                    太棒了！<br/>目前沒有任何未結清的項目。
+                  </div>
+                ) : activeDebts.map(debt => renderDebtCard(debt, false))}
+              </div>
+            </div>
+          ) : activeTab === 'history' ? (
+            <div className="p-4 space-y-6 animate-fade-in bg-slate-50 h-full">
+              <h2 className="text-2xl font-bold text-green-700 pt-2 border-l-4 border-green-500 pl-3 mb-6 flex items-center gap-2">
+                <History size={24} /> 歷史完賽榮譽榜
+              </h2>
+              <div className="space-y-4">
+                {completedDebts.length === 0 ? (
                   <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-8 text-center text-slate-400 flex flex-col items-center justify-center">
                     <Database size={40} className="text-slate-200 mb-3" />
-                    資料庫是空的。<br/>點擊下方「新增項目」開始記帳吧！
+                    目前還沒有跑完的馬拉松項目喔！<br/>繼續加油！
                   </div>
-                ) : debts.map(debt => {
-                  const monthlyTotal = Math.round(debt.totalAmount / debt.periods);
-                  const perPersonMonthly = Math.round(monthlyTotal / 2);
-                  return (
-                    <div key={debt.id} className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                      <div className="p-4 bg-slate-50 border-b border-slate-100 flex justify-between items-start">
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <h3 className="font-bold text-lg text-slate-800">{debt.name}</h3>
-                            <button onClick={() => handleEditDebt(debt)} className="text-slate-400 hover:text-blue-500 transition-colors p-1">
-                              <Edit size={16} />
-                            </button>
-                            <button onClick={() => handleDeleteDebt(debt.id)} className="text-slate-400 hover:text-red-500 transition-colors p-1">
-                              <Trash2 size={16} />
-                            </button>
-                          </div>
-                          <p className="text-sm text-slate-500 mt-1">總額 NT${debt.totalAmount.toLocaleString()} • 分 {debt.periods} 期</p>
-                        </div>
-                        <div className="bg-blue-100 text-blue-800 px-3 py-2 rounded-lg text-center shadow-inner">
-                          <p className="text-[10px] font-bold flex items-center justify-center gap-1 mb-1 text-blue-600"><Users size={12} /> 一人一月</p>
-                          <p className="text-xl font-black">NT${perPersonMonthly.toLocaleString()}</p>
-                        </div>
-                      </div>
-
-                      <div className="p-4">
-                        <div className="grid grid-cols-3 gap-3">
-                          {Array.from({ length: debt.periods }).map((_, index) => {
-                            const isPaid = debt.paidPeriods.includes(index);
-                            const monthLabel = getMonthString(debt.startYear, debt.startMonth, index);
-                            return (
-                              <button key={index} onClick={() => togglePaidStatus(debt.id, index)} className={`flex items-center gap-2 p-2 rounded-md transition-colors border ${isPaid ? 'bg-green-50 border-green-200 text-green-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
-                                {isPaid ? <CheckCircle2 size={18} className="text-green-500 flex-shrink-0" /> : <Circle size={18} className="text-slate-300 flex-shrink-0" />}
-                                <span className={`text-xs font-medium ${isPaid ? 'line-through opacity-70' : ''}`}>{monthLabel}</span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                        
-                        <div className="mt-6 mb-2">
-                          <div className="flex justify-between items-end mb-2">
-                            <span className="text-xs font-bold text-slate-500 bg-slate-100 px-2 py-1 rounded-md">還款馬拉松</span>
-                            <span className="text-xs text-slate-400 font-medium">{debt.paidPeriods.length} / {debt.periods} 期</span>
-                          </div>
-                          <div className="text-[11px] sm:text-xs font-bold text-blue-700 mb-4 bg-blue-50 py-2 px-1 rounded-lg text-center shadow-sm border border-blue-100 whitespace-nowrap tracking-tight overflow-hidden">
-                            {debt.paidPeriods.length / debt.periods < 0.34 ? "🏃 起步：錢沒不見，只是變成你要的樣子！" : debt.paidPeriods.length / debt.periods < 0.67 ? "🐕 穩健：不知不覺已跨越三分之一，繼續保持！" : debt.paidPeriods.length / debt.periods < 1 ? "🔥 衝刺：快到終點了，未來的你會感謝努力的自己！" : "🎉 達陣：這場馬拉松順利完賽，給自己一個大擁抱！"}
-                          </div>
-                          <div className="flex items-center gap-2 relative h-12 px-1 mt-2">
-                            <div className="w-8 h-8 flex items-center justify-center bg-white rounded-full shadow-md border border-slate-200 z-10 flex-shrink-0"><span className="text-lg">🚩</span></div>
-                            <div className="flex-1 relative h-3 bg-slate-200 rounded-full shadow-inner">
-                              <div className="bg-gradient-to-r from-blue-400 to-indigo-500 h-full rounded-full transition-all duration-1000 ease-out relative" style={{ width: `${(debt.paidPeriods.length / debt.periods) * 100}%` }}>
-                                <div className="absolute right-0 top-1/2 -translate-y-[70%] translate-x-1/2 z-20 flex flex-col items-center">
-                                  <div className="animate-bounce drop-shadow-md text-2xl" style={{ textShadow: '0 2px 4px rgba(0,0,0,0.2)' }}>🐶</div>
-                                </div>
-                              </div>
-                            </div>
-                            <div className="w-8 h-8 flex items-center justify-center bg-white rounded-full shadow-md border border-slate-200 z-10 flex-shrink-0"><span className="text-lg">🏁</span></div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
+                ) : completedDebts.map(debt => renderDebtCard(debt, true))}
               </div>
             </div>
           ) : (
@@ -465,13 +545,15 @@ export default function App() {
           )}
         </main>
 
-        {/* 底部導覽 */}
         <nav className="absolute bottom-0 w-full bg-white border-t border-slate-200 flex justify-around items-center pb-safe shadow-[0_-10px_20px_rgba(0,0,0,0.03)] z-20">
           <button onClick={() => { setActiveTab('list'); resetForm(); }} className={`flex flex-col items-center flex-1 py-3 transition-colors ${activeTab === 'list' ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}>
-            <List size={24} className="mb-1" /><span className="text-[11px] font-bold">還款明細</span>
+            <List size={24} className="mb-1" /><span className="text-[11px] font-bold">明細</span>
+          </button>
+          <button onClick={() => { setActiveTab('history'); resetForm(); }} className={`flex flex-col items-center flex-1 py-3 transition-colors ${activeTab === 'history' ? 'text-green-600' : 'text-slate-400 hover:text-slate-600'}`}>
+            <History size={24} className="mb-1" /><span className="text-[11px] font-bold">歷史</span>
           </button>
           <button onClick={() => { setActiveTab('add'); resetForm(); }} className={`flex flex-col items-center flex-1 py-3 transition-colors ${activeTab === 'add' ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}>
-            <PlusCircle size={24} className="mb-1" /><span className="text-[11px] font-bold">新增項目</span>
+            <PlusCircle size={24} className="mb-1" /><span className="text-[11px] font-bold">新增</span>
           </button>
         </nav>
       </div>
